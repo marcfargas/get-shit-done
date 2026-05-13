@@ -1087,19 +1087,61 @@ function getRoadmapPhaseInternal(cwd, phaseNum) {
 // ─── Agent installation validation (#1371) ───────────────────────────────────
 
 /**
+ * Probe a candidate marketplace root for a Claude Code `--claude-plugin`
+ * install. Returns the plugin's `agents/` path when BOTH the
+ * `.claude-plugin/plugin.json` marker AND the `agents/` directory exist;
+ * `null` otherwise.
+ *
+ * Mirrors the layout produced by `bin/install.js` in plugin mode:
+ *   <root>/.claude/gsd/plugins/gsd/.claude-plugin/plugin.json
+ *   <root>/.claude/gsd/plugins/gsd/agents/
+ *
+ * @param {string} root - Marketplace root (project dir or homedir)
+ * @returns {string|null}
+ */
+function pluginAgentsDirIfPresent(root) {
+  const pluginRoot = path.join(root, '.claude', 'gsd', 'plugins', 'gsd');
+  const manifest = path.join(pluginRoot, '.claude-plugin', 'plugin.json');
+  const agentsDir = path.join(pluginRoot, 'agents');
+  try {
+    if (!fs.existsSync(manifest)) return null;
+    if (!fs.existsSync(agentsDir) || !fs.statSync(agentsDir).isDirectory()) return null;
+    return agentsDir;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolve the agents directory from the GSD install location.
  * gsd-tools.cjs lives at <configDir>/get-shit-done/bin/gsd-tools.cjs,
  * so agents/ is at <configDir>/agents/.
  *
- * GSD_AGENTS_DIR env var overrides the default path. Used in tests and for
- * installs where the agents directory is not co-located with gsd-tools.cjs.
+ * Precedence (mirror of `sdk/src/query/helpers.ts:resolveAgentsDir`):
+ *   1. `GSD_AGENTS_DIR` env var — explicit override
+ *   2. `<projectDir>/.claude/gsd/plugins/gsd/agents/` — per-project plugin
+ *      install (only when both `plugin.json` and `agents/` exist)
+ *   3. `<homedir()>/.claude/gsd/plugins/gsd/agents/` — global plugin install
+ *      (same dual-marker gate)
+ *   4. `<configDir>/agents/` — installer-parity default (3 levels up from
+ *      this file)
  *
+ * Tiers 2 and 3 only apply to Claude Code installs (the `--claude-plugin`
+ * install mode is Claude Code only — matches `bin/install.js` gating).
+ *
+ * @param {string} [projectDir] - Project root for per-project plugin probe
  * @returns {string} Absolute path to the agents directory
  */
-function getAgentsDir() {
+function getAgentsDir(projectDir) {
   if (process.env.GSD_AGENTS_DIR) {
     return process.env.GSD_AGENTS_DIR;
   }
+  if (projectDir) {
+    const projectPluginAgents = pluginAgentsDirIfPresent(projectDir);
+    if (projectPluginAgents) return projectPluginAgents;
+  }
+  const globalPluginAgents = pluginAgentsDirIfPresent(os.homedir());
+  if (globalPluginAgents) return globalPluginAgents;
   // __dirname is get-shit-done/bin/lib/ → go up 3 levels to configDir
   return path.join(__dirname, '..', '..', '..', 'agents');
 }
@@ -1111,10 +1153,12 @@ function getAgentsDir() {
  * Recognises both standard format (gsd-planner.md) and Copilot format
  * (gsd-planner.agent.md). Copilot renames agent files during install (#1512).
  *
+ * @param {string} [projectDir] - Project root forwarded to `getAgentsDir` so
+ *   the per-project `--claude-plugin` install layout wins over the global one.
  * @returns {{ agents_installed: boolean, missing_agents: string[], installed_agents: string[], agents_dir: string }}
  */
-function checkAgentsInstalled() {
-  const agentsDir = getAgentsDir();
+function checkAgentsInstalled(projectDir) {
+  const agentsDir = getAgentsDir(projectDir);
   const expectedAgents = Object.keys(MODEL_PROFILES);
   const installed = [];
   const missing = [];

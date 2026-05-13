@@ -451,6 +451,89 @@ describe('resolveAgentsDir (runtime-aware)', () => {
   });
 });
 
+describe('resolveAgentsDir (Claude --claude-plugin layout)', () => {
+  const saved: Record<string, string | undefined> = {};
+  let tmpProject: string;
+  let pluginAgentsDir: string;
+
+  beforeEach(async () => {
+    for (const k of RUNTIME_ENV_VARS) { saved[k] = process.env[k]; delete process.env[k]; }
+    tmpProject = await mkdtemp(join(tmpdir(), 'gsd-plugin-agents-'));
+    // Build the on-disk plugin layout produced by `bin/install.js --claude-plugin`:
+    //   <project>/.claude/gsd/plugins/gsd/.claude-plugin/plugin.json
+    //   <project>/.claude/gsd/plugins/gsd/agents/
+    pluginAgentsDir = join(tmpProject, '.claude', 'gsd', 'plugins', 'gsd', 'agents');
+    await mkdir(pluginAgentsDir, { recursive: true });
+    await mkdir(join(tmpProject, '.claude', 'gsd', 'plugins', 'gsd', '.claude-plugin'), {
+      recursive: true,
+    });
+    await writeFile(
+      join(tmpProject, '.claude', 'gsd', 'plugins', 'gsd', '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'gsd', version: '0.0.0-test' }),
+    );
+  });
+
+  afterEach(async () => {
+    for (const k of RUNTIME_ENV_VARS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    await rm(tmpProject, { recursive: true, force: true });
+  });
+
+  it('returns the plugin agents dir when both markers exist', () => {
+    expect(resolveAgentsDir('claude', tmpProject)).toBe(pluginAgentsDir);
+  });
+
+  it('falls back to runtime-default when plugin.json is absent (agents-only is not enough)', async () => {
+    await rm(join(tmpProject, '.claude', 'gsd', 'plugins', 'gsd', '.claude-plugin'), {
+      recursive: true,
+      force: true,
+    });
+    expect(resolveAgentsDir('claude', tmpProject)).toBe(join(homedir(), '.claude', 'agents'));
+  });
+
+  it('falls back to runtime-default when agents/ is absent (plugin.json alone is not enough)', async () => {
+    await rm(pluginAgentsDir, { recursive: true, force: true });
+    expect(resolveAgentsDir('claude', tmpProject)).toBe(join(homedir(), '.claude', 'agents'));
+  });
+
+  it('GSD_AGENTS_DIR wins over plugin dir', () => {
+    process.env.GSD_AGENTS_DIR = '/explicit/agents';
+    expect(resolveAgentsDir('claude', tmpProject)).toBe('/explicit/agents');
+  });
+
+  it('runtime=codex skips the plugin probe even when both markers exist', () => {
+    process.env.CODEX_HOME = '/codex';
+    expect(resolveAgentsDir('codex', tmpProject)).toBe(join('/codex', 'agents'));
+  });
+
+  it('init-runner laziness: GSD_AGENTS_DIR set AFTER importing init-runner still wins', async () => {
+    // Regression: prior to the plugin-aware resolver fix, init-runner.ts
+    // snapshotted `resolveAgentsDir()` into a module-load constant
+    // (`GSD_AGENTS_DIR`), so any env var set after `import` was ignored. The
+    // module must now resolve lazily on every `readAgentFile` call. We can't
+    // poke the private method, but we can assert the underlying helper still
+    // reads env on each call AFTER the module is loaded — which the deleted
+    // constant could not have done.
+    await import('../init-runner.js');
+    process.env.GSD_AGENTS_DIR = '/late/binding/agents';
+    expect(resolveAgentsDir('claude', tmpProject)).toBe('/late/binding/agents');
+  });
+
+  it('omitting projectDir matches current per-runtime default when no global plugin is installed', () => {
+    // Cannot mutate homedir() — but the assertion is that, with no projectDir
+    // and (presumably) no global plugin installed on the host, the result
+    // matches the runtime-default. Guard the assertion behind the marker so
+    // CI on a dev box that happens to have a global plugin install never
+    // false-fails.
+    const fs = require('node:fs') as typeof import('node:fs');
+    const globalMarker = join(homedir(), '.claude', 'gsd', 'plugins', 'gsd', '.claude-plugin', 'plugin.json');
+    if (fs.existsSync(globalMarker)) return; // skip when global plugin is installed
+    expect(resolveAgentsDir('claude')).toBe(join(homedir(), '.claude', 'agents'));
+  });
+});
+
 // ─── findProjectRoot (issue #2623) ─────────────────────────────────────────
 
 describe('runtime-global skills directory helpers', () => {

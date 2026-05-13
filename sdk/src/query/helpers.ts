@@ -105,17 +105,58 @@ export function detectRuntime(config?: { runtime?: unknown }): Runtime {
 }
 
 /**
+ * Probe a candidate marketplace root (`<root>/.claude/gsd/plugins/gsd/`) for a
+ * Claude Code `--claude-plugin` install. Returns the plugin's `agents/` path
+ * when BOTH the `.claude-plugin/plugin.json` marker and the `agents/`
+ * directory exist; returns `null` otherwise.
+ *
+ * Mirrors the layout produced by `bin/install.js` in plugin mode
+ * (commit 0c76f1af):
+ *   <root>/.claude/gsd/plugins/gsd/.claude-plugin/plugin.json
+ *   <root>/.claude/gsd/plugins/gsd/agents/
+ */
+function pluginAgentsDirIfPresent(root: string): string | null {
+  const pluginRoot = join(root, '.claude', 'gsd', 'plugins', 'gsd');
+  const manifest = join(pluginRoot, '.claude-plugin', 'plugin.json');
+  const agentsDir = join(pluginRoot, 'agents');
+  try {
+    if (!existsSync(manifest)) return null;
+    if (!existsSync(agentsDir) || !statSync(agentsDir).isDirectory()) return null;
+    return agentsDir;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolve the GSD agents directory for a given runtime.
  *
  * Precedence:
  *   1. `GSD_AGENTS_DIR` — explicit SDK override (wins over runtime selection)
- *   2. `<getRuntimeConfigDir(runtime)>/agents` — installer-parity default
+ *   2. `<projectDir>/.claude/gsd/plugins/gsd/agents/` — per-project plugin
+ *      install (Claude Code only; only when both `plugin.json` and `agents/`
+ *      exist beneath the marketplace root)
+ *   3. `<homedir()>/.claude/gsd/plugins/gsd/agents/` — global plugin install
+ *      (Claude Code only; same dual-marker gate as tier 2)
+ *   4. `<getRuntimeConfigDir(runtime)>/agents` — installer-parity default
+ *
+ * Tiers 2 and 3 only fire for `runtime === 'claude'` because the
+ * `--claude-plugin` install mode is Claude Code only (matches the installer's
+ * own gating in `bin/install.js`).
  *
  * Defaults to Claude when no runtime is passed, matching prior behavior
  * (see `init-runner.ts`, which is Claude-only by design).
  */
-export function resolveAgentsDir(runtime: Runtime = 'claude'): string {
+export function resolveAgentsDir(runtime: Runtime = 'claude', projectDir?: string): string {
   if (process.env.GSD_AGENTS_DIR) return process.env.GSD_AGENTS_DIR;
+  if (runtime === 'claude') {
+    if (projectDir) {
+      const projectPluginAgents = pluginAgentsDirIfPresent(projectDir);
+      if (projectPluginAgents) return projectPluginAgents;
+    }
+    const globalPluginAgents = pluginAgentsDirIfPresent(homedir());
+    if (globalPluginAgents) return globalPluginAgents;
+  }
   return join(getRuntimeConfigDir(runtime), 'agents');
 }
 

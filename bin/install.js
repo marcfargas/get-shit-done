@@ -110,6 +110,24 @@ const CODEX_AGENT_SANDBOX = {
   'gsd-integration-checker': 'read-only',
 };
 
+// GSD hook descriptor table. Single source of truth for the matcher / timeout /
+// event / runner shape of each managed hook. The plugin-mode install branch
+// drives its hooks.json emit from this table; the legacy writeSettings block
+// remains the historical authority for its own mutations and is intentionally
+// not refactored to consume this table (its in-place dedupe + context-monitor
+// migration interact with settings.hooks mutations and must stay byte-stable).
+const GSD_HOOK_REGISTRY = [
+  { file: 'gsd-check-update.js',           event: 'SessionStart', runner: 'node' },
+  { file: 'gsd-context-monitor.js',        event: 'PostToolUse',  runner: 'node', matcher: 'Bash|Edit|Write|MultiEdit|Agent|Task', timeout: 10 },
+  { file: 'gsd-read-injection-scanner.js', event: 'PostToolUse',  runner: 'node', matcher: 'Read',          timeout: 5 },
+  { file: 'gsd-phase-boundary.sh',         event: 'PostToolUse',  runner: 'bash', matcher: 'Write|Edit',    timeout: 5 },
+  { file: 'gsd-prompt-guard.js',           event: 'PreToolUse',   runner: 'node', matcher: 'Write|Edit',    timeout: 5 },
+  { file: 'gsd-read-guard.js',             event: 'PreToolUse',   runner: 'node', matcher: 'Write|Edit',    timeout: 5 },
+  { file: 'gsd-workflow-guard.js',         event: 'PreToolUse',   runner: 'node', matcher: 'Write|Edit',    timeout: 5 },
+  { file: 'gsd-validate-commit.sh',        event: 'PreToolUse',   runner: 'bash', matcher: 'Bash',          timeout: 5 },
+  { file: 'gsd-session-state.sh',          event: 'SessionStart', runner: 'bash' },
+];
+
 // Copilot tool name mapping — Claude Code tools to GitHub Copilot tools
 // Tool mapping applies ONLY to agents, NOT to skills (per CONTEXT.md decision)
 const claudeToCopilotTools = {
@@ -178,6 +196,7 @@ const hasGlobal = args.includes('--global') || args.includes('-g');
 const hasLocal = args.includes('--local') || args.includes('-l');
 const hasOpencode = args.includes('--opencode');
 const hasClaude = args.includes('--claude');
+const hasClaudePlugin = args.includes('--claude-plugin');
 const hasGemini = args.includes('--gemini');
 const hasKilo = args.includes('--kilo');
 const hasCodex = args.includes('--codex');
@@ -233,6 +252,8 @@ if (hasAll) {
   selectedRuntimes = ['claude', 'opencode'];
 } else {
   if (hasClaude) selectedRuntimes.push('claude');
+  // --claude-plugin implies the Claude runtime.
+  if (hasClaudePlugin && !hasClaude) selectedRuntimes.push('claude');
   if (hasOpencode) selectedRuntimes.push('opencode');
   if (hasGemini) selectedRuntimes.push('gemini');
   if (hasKilo) selectedRuntimes.push('kilo');
@@ -6553,12 +6574,109 @@ function validateHookFields(settings) {
 }
 
 /**
+ * Plugin-mode uninstall for Claude Code (--claude-plugin install layout).
+ *
+ * Mirror image of the install-side plugin emit: remove the marketplace tree
+ * (`<scope-root>/.claude/gsd/` containing `plugins/gsd/` + the
+ * `.claude-plugin/marketplace.json` catalog) and deregister via the
+ * `claude plugin` CLI so Claude Code rewrites its own settings.json (we never
+ * touch ~/.claude/settings.json — the whole point of plugin mode, #3426).
+ *
+ * Subprocess failures print a manual-recovery hint and continue; the file
+ * removal step still proceeds so the user is never left in a half-uninstalled
+ * state. Same try/catch shape as the install-side `runClaude` helper.
+ */
+function uninstallClaudePlugin(isGlobal, marketplaceDir) {
+  const claudeScope = isGlobal ? 'user' : 'project';
+  const locationLabel = isGlobal
+    ? marketplaceDir.replace(os.homedir(), '~')
+    : marketplaceDir.replace(process.cwd(), '.');
+
+  console.log(`  Uninstalling GSD plugin from ${cyan}Claude Code${reset} at ${cyan}${locationLabel}${reset} (scope: ${claudeScope})\n`);
+
+  // 1. Deregister from Claude Code first — let the CLI rewrite settings.json
+  // (enabledPlugins / extraKnownMarketplaces) in its own schema. We run
+  // `plugin uninstall` first, then `marketplace remove`: the CLI docs note
+  // that `marketplace remove` will cascade-uninstall plugins, but doing it
+  // explicitly in two steps gives clearer per-step output and matches the
+  // install-side two-step flow (marketplace add → plugin install).
+  const cp = require('child_process');
+  const runClaude = (args, label) => {
+    try {
+      const out = cp.execSync(`claude ${args}`, {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const trimmed = (out || '').trim();
+      if (trimmed) console.log(`    ${trimmed}`);
+      console.log(`  ${green}✓${reset} ${label}`);
+      return { ok: true };
+    } catch (err) {
+      const stderr = (err && err.stderr && err.stderr.toString()) || '';
+      const stdout = (err && err.stdout && err.stdout.toString()) || '';
+      const msg = (stderr || stdout || err.message || '').trim();
+      return { ok: false, msg };
+    }
+  };
+
+  console.log(`  Deregistering plugin from Claude Code (scope: ${claudeScope})...`);
+  const uninstallResult = runClaude(
+    `plugin uninstall gsd@gsd-local --scope ${claudeScope}`,
+    `claude plugin uninstall gsd@gsd-local (scope: ${claudeScope})`
+  );
+  if (!uninstallResult.ok) {
+    console.log(`  ${yellow}⚠${reset} \`claude plugin uninstall\` failed${uninstallResult.msg ? `: ${uninstallResult.msg}` : ''} — proceeding with file removal anyway.`);
+    console.log(`     Run this manually to clean up Claude Code's settings.json:`);
+    console.log(`       claude plugin uninstall gsd@gsd-local --scope ${claudeScope}`);
+  }
+
+  // `claude plugin marketplace remove` is scope-less (it removes the
+  // marketplace from wherever it's registered). Only `plugin install/uninstall`
+  // takes --scope, matching the CLI surface as of claude-code 2.1.x.
+  const removeResult = runClaude(
+    `plugin marketplace remove gsd-local`,
+    `claude plugin marketplace remove gsd-local`
+  );
+  if (!removeResult.ok) {
+    console.log(`  ${yellow}⚠${reset} \`claude plugin marketplace remove\` failed${removeResult.msg ? `: ${removeResult.msg}` : ''} — proceeding with file removal anyway.`);
+    console.log(`     Run this manually to clean up Claude Code's settings.json:`);
+    console.log(`       claude plugin marketplace remove gsd-local`);
+  }
+
+  // 2. Remove the marketplace tree on disk. `<scope-root>/.claude/gsd/`
+  // contains both `plugins/gsd/` and `.claude-plugin/marketplace.json`, and
+  // is wholly owned by GSD — no user content lives there, so a recursive
+  // wipe is safe.
+  let removedCount = 0;
+  if (fs.existsSync(marketplaceDir)) {
+    fs.rmSync(marketplaceDir, { recursive: true, force: true });
+    removedCount++;
+    console.log(`  ${green}✓${reset} Removed plugin marketplace tree (${locationLabel})`);
+  } else {
+    console.log(`  ${yellow}⚠${reset} Plugin marketplace directory not present: ${locationLabel}`);
+  }
+
+  if (removedCount === 0 && uninstallResult.ok === false && removeResult.ok === false) {
+    console.log(`  ${yellow}⚠${reset} No GSD plugin files found to remove.`);
+  }
+
+  console.log(`
+  ${green}Done!${reset} GSD plugin has been uninstalled from Claude Code.
+  Your other files and settings have been preserved.
+`);
+}
+
+/**
  * Uninstall GSD from the specified directory for a specific runtime
  * Removes only GSD-specific files/directories, preserves user content
  * @param {boolean} isGlobal - Whether to uninstall from global or local
  * @param {string} runtime - Target runtime ('claude', 'opencode', 'gemini', 'codex', 'copilot')
+ * @param {boolean} pluginModeRequested - Whether --claude-plugin was explicitly passed.
+ *   If false but a plugin install is detected on disk for the (isGlobal, runtime='claude')
+ *   scope, the plugin uninstall path is auto-selected so users don't have to remember
+ *   which mode they installed in.
  */
-function uninstall(isGlobal, runtime = 'claude') {
+function uninstall(isGlobal, runtime = 'claude', pluginModeRequested = false) {
   const isOpencode = runtime === 'opencode';
   const isKilo = runtime === 'kilo';
   const isGemini = runtime === 'gemini';
@@ -6573,6 +6691,27 @@ function uninstall(isGlobal, runtime = 'claude') {
   const isHermes = runtime === 'hermes';
   const isCodebuddy = runtime === 'codebuddy';
   const dirName = getDirName(runtime);
+
+  // Plugin-mode uninstall: mirror the install-side `marketplaceDir` derivation
+  // exactly so paths stay consistent (#3426 followup). Plugin layout only
+  // applies to the Claude Code runtime; other runtimes fall through to legacy.
+  const marketplaceDir = runtime === 'claude'
+    ? (isGlobal
+        ? path.join(os.homedir(), '.claude', 'gsd')
+        : path.join(process.cwd(), '.claude', 'gsd'))
+    : null;
+  // Auto-detect a plugin install if --claude-plugin wasn't explicitly passed:
+  // a marketplace.json (or VERSION marker at the plugin root) at the expected
+  // path means we should run the plugin uninstall flow, not the legacy one.
+  const pluginInstallDetected = marketplaceDir !== null && (
+    fs.existsSync(path.join(marketplaceDir, '.claude-plugin', 'marketplace.json')) ||
+    fs.existsSync(path.join(marketplaceDir, 'plugins', 'gsd', 'VERSION'))
+  );
+  const pluginMode = runtime === 'claude' && (pluginModeRequested || pluginInstallDetected);
+
+  if (pluginMode) {
+    return uninstallClaudePlugin(isGlobal, marketplaceDir);
+  }
 
   // Get the target directory based on runtime and install type
   const targetDir = isGlobal
@@ -7374,8 +7513,12 @@ function writeManifest(configDir, runtime = 'claude', options = {}) {
   const isTrae = runtime === 'trae';
   const isCline = runtime === 'cline';
   const isHermes = runtime === 'hermes';
+  const pluginMode = options.pluginMode === true;
   const gsdDir = path.join(configDir, 'get-shit-done');
-  const commandsDir = path.join(configDir, 'commands', 'gsd');
+  const commandsDir = pluginMode
+    ? path.join(configDir, 'commands')
+    : path.join(configDir, 'commands', 'gsd');
+  const commandsManifestPrefix = pluginMode ? 'commands/' : 'commands/gsd/';
   const opencodeCommandDir = path.join(configDir, 'command');
   // Hermes nests GSD skills under skills/gsd/ as a single category (#2841).
   // All other runtimes that use the Codex-style skills layout use a flat skills/ root.
@@ -7409,7 +7552,7 @@ function writeManifest(configDir, runtime = 'claude', options = {}) {
   if (fs.existsSync(commandsDir)) {
     const cmdHashes = generateManifest(commandsDir);
     for (const [rel, hash] of Object.entries(cmdHashes)) {
-      manifest.files['commands/gsd/' + rel] = hash;
+      manifest.files[commandsManifestPrefix + rel] = hash;
     }
   }
   if ((isOpencode || isKilo) && fs.existsSync(opencodeCommandDir)) {
@@ -7453,18 +7596,26 @@ function writeManifest(configDir, runtime = 'claude', options = {}) {
   }
 
   // Track hook files so saveLocalPatches() can detect user modifications
-  // Hooks are only installed for runtimes that use settings.json (not Codex/Copilot/Cline)
+  // Hooks are only installed for runtimes that use settings.json (not Codex/Copilot/Cline).
+  // Plugin mode (#3428) writes hook scripts to <plugin>/bin/ instead of <config>/hooks/
+  // because <plugin>/hooks/ carries the Claude Code hooks.json manifest. Both layouts
+  // need to be manifested so user local patches survive reinstall.
   if (!isCodex && !isCopilot && !isCline) {
-    const hooksDir = path.join(configDir, 'hooks');
-    if (fs.existsSync(hooksDir)) {
-      for (const file of fs.readdirSync(hooksDir)) {
+    const hooksScriptDir = pluginMode
+      ? path.join(configDir, 'bin')
+      : path.join(configDir, 'hooks');
+    const hooksManifestPrefix = pluginMode ? 'bin/' : 'hooks/';
+    if (fs.existsSync(hooksScriptDir)) {
+      for (const file of fs.readdirSync(hooksScriptDir)) {
         if (file.startsWith('gsd-') && (file.endsWith('.js') || file.endsWith('.sh'))) {
-          manifest.files['hooks/' + file] = fileHash(path.join(hooksDir, file));
+          manifest.files[hooksManifestPrefix + file] = fileHash(path.join(hooksScriptDir, file));
         }
       }
       // Track hooks/lib/ helpers so saveLocalPatches() can back up user edits
       // to git-cmd.js (validate-commit classifier) and gsd-graphify-rebuild.sh.
-      const hooksLibDir = path.join(hooksDir, 'lib');
+      // lib/ helpers always live under hooks/lib/ (not bin/lib/) in both plugin
+      // and legacy layouts — the manifest key is hardcoded to 'hooks/lib/' above.
+      const hooksLibDir = path.join(configDir, 'hooks', 'lib');
       if (fs.existsSync(hooksLibDir)) {
         for (const file of fs.readdirSync(hooksLibDir)) {
           if (GSD_HOOK_LIB_FILES.includes(file)) {
@@ -7735,6 +7886,26 @@ function install(isGlobal, runtime = 'claude', options = {}) {
   const dirName = getDirName(runtime);
   const src = path.join(__dirname, '..');
 
+  // --claude-plugin emits a Claude Code *local marketplace* whose single
+  // plugin is gsd. Layout:
+  //   <marketplace-root>/.claude-plugin/marketplace.json   catalog
+  //   <marketplace-root>/plugins/gsd/                       plugin root (targetDir)
+  // marketplace-root is:
+  //     $HOME/.claude/gsd/             for --global
+  //     <project>/.claude/gsd/         for --local
+  // Claude Code does NOT auto-discover plugins from arbitrary paths — it
+  // only loads them via a marketplace registered through `claude plugin
+  // marketplace add` (or via `--plugin-dir` per session). Emitting a
+  // marketplace and invoking the CLI to register it is what makes the
+  // install actually visible. The CLI also owns settings.json mutation, so
+  // we never write to ~/.claude/settings.json ourselves (#3426, #2303).
+  const pluginMode = hasClaudePlugin && runtime === 'claude';
+  const marketplaceDir = pluginMode
+    ? (isGlobal
+        ? path.join(os.homedir(), '.claude', 'gsd')
+        : path.join(process.cwd(), '.claude', 'gsd'))
+    : null;
+
   // Reusable helper to copy hooks/lib/ (git-cmd.js + gsd-graphify-rebuild.sh).
   // Defined early so it is visible to both the main and Codex code paths.
   // `allowlist` (when non-empty) restricts copying to the named top-level entries,
@@ -7768,11 +7939,13 @@ function install(isGlobal, runtime = 'claude', options = {}) {
   // Get the target directory based on runtime and install type.
   // Cline local installs write to the project root (like Claude Code) — .clinerules
   // lives at the root, not inside a .cline/ subdirectory.
-  const targetDir = isGlobal
-    ? getGlobalDir(runtime, explicitConfigDir)
-    : isCline
-      ? process.cwd()
-      : path.join(process.cwd(), dirName);
+  const targetDir = pluginMode
+    ? path.join(marketplaceDir, 'plugins', 'gsd')
+    : isGlobal
+      ? getGlobalDir(runtime, explicitConfigDir)
+      : isCline
+        ? process.cwd()
+        : path.join(process.cwd(), dirName);
 
   const locationLabel = isGlobal
     ? targetDir.replace(os.homedir(), '~')
@@ -7879,13 +8052,20 @@ function install(isGlobal, runtime = 'claude', options = {}) {
   const resolvedTarget = path.resolve(targetDir).replace(/\\/g, '/');
   const homeDir = os.homedir().replace(/\\/g, '/');
   const isWindowsHost = process.platform === 'win32';
-  const pathPrefix = computePathPrefix({
-    isGlobal,
-    isOpencode,
-    isWindowsHost,
-    resolvedTarget,
-    homeDir,
-  });
+  // Plugin mode: always use the absolute on-disk plugin root as the path
+  // prefix (no `$HOME` substitution) so `@~/.claude/get-shit-done/...`
+  // references in command/workflow markdown rewrite to absolute paths inside
+  // the plugin tree. This is the same machinery that already powers --local;
+  // we just point it at the plugin's directory.
+  const pathPrefix = pluginMode
+    ? `${resolvedTarget}/`
+    : computePathPrefix({
+        isGlobal,
+        isOpencode,
+        isWindowsHost,
+        resolvedTarget,
+        homeDir,
+      });
 
   let runtimeLabel = 'Claude Code';
   if (isOpencode) runtimeLabel = 'OpenCode';
@@ -8293,6 +8473,19 @@ function install(isGlobal, runtime = 'claude', options = {}) {
         failures.push('commands/gsd');
       }
     }
+  } else if (pluginMode) {
+    // Claude Code plugin: flattened commands/*.md layout. The existing
+    // copyWithPathReplacement rewrites `@~/.claude/...` → `@<pathPrefix>...`
+    // so command @-includes still resolve inside the plugin tree.
+    const commandsDir = path.join(targetDir, 'commands');
+    const gsdSrc = stageSkillsForMode(path.join(src, 'commands', 'gsd'), _effectiveInstallMode);
+    copyWithPathReplacement(gsdSrc, commandsDir, pathPrefix, runtime, true, isGlobal);
+    if (verifyInstalled(commandsDir, 'commands')) {
+      const count = fs.readdirSync(commandsDir).filter(f => f.endsWith('.md')).length;
+      console.log(`  ${green}✓${reset} Installed ${count} commands to commands/ (plugin layout)`);
+    } else {
+      failures.push('commands');
+    }
   } else {
     // Claude Code local: commands/gsd/ format — Claude Code reads local project
     // commands from .claude/commands/gsd/, not .claude/skills/
@@ -8531,7 +8724,9 @@ function install(isGlobal, runtime = 'claude', options = {}) {
     // Template paths for the target runtime (replaces '.claude' with correct config dir)
     const hooksSrc = path.join(src, 'hooks', 'dist');
     if (fs.existsSync(hooksSrc)) {
-      const hooksDest = path.join(targetDir, 'hooks');
+      const hooksDest = pluginMode
+        ? path.join(targetDir, 'bin')
+        : path.join(targetDir, 'hooks');
       fs.mkdirSync(hooksDest, { recursive: true });
       const hookEntries = fs.readdirSync(hooksSrc);
       const configDirReplacement = getConfigDirFromHome(runtime, isGlobal);
@@ -8631,7 +8826,7 @@ function install(isGlobal, runtime = 'claude', options = {}) {
   }
 
   // Write file manifest for future modification detection
-  writeManifest(targetDir, runtime, { mode: _effectiveInstallMode });
+  writeManifest(targetDir, runtime, { mode: _effectiveInstallMode, pluginMode });
   console.log(`  ${green}✓${reset} Wrote file manifest (${MANIFEST_NAME})`);
 
   // Report any backed-up local patches
@@ -9098,6 +9293,190 @@ function install(isGlobal, runtime = 'claude', options = {}) {
     return { settingsPath: null, settings: null, statuslineCommand: null, updateBannerCommand: null, runtime, configDir: targetDir };
   }
 
+  if (pluginMode) {
+    // Claude Code plugin mode: emit a local marketplace catalog plus the
+    // plugin itself. Layout:
+    //   <marketplaceDir>/.claude-plugin/marketplace.json    catalog
+    //   <targetDir = marketplaceDir/plugins/gsd>/.claude-plugin/plugin.json
+    //   <targetDir>/hooks/hooks.json     auto-loaded plugin hook manifest
+    //   <targetDir>/VERSION              scope-detection marker for /gsd-update
+    //
+    // After emission we shell out to the `claude plugin` CLI to register the
+    // marketplace and install the plugin. That lets Claude Code manage its
+    // own settings.json (writing `extraKnownMarketplaces` / `enabledPlugins`
+    // in the schema it controls) — we never touch ~/.claude/settings.json
+    // ourselves, which is the structural fix for #3426 and #2303.
+    //
+    // hook script commands inside hooks.json use ${CLAUDE_PLUGIN_ROOT},
+    // which Claude Code expands at hook-evaluation time (the upstream bug
+    // that prevented ${CLAUDE_PLUGIN_ROOT} expansion in COMMAND markdown
+    // does NOT apply to hooks.json — see PR description).
+    const manifestDir = path.join(targetDir, '.claude-plugin');
+    fs.mkdirSync(manifestDir, { recursive: true });
+    const manifest = {
+      name: 'gsd',
+      description: 'GSD (Get Shit Done) — phase-based AI dev workflow',
+      version: pkg.version,
+      author: { name: 'gsd-build' },
+      repository: 'https://github.com/gsd-build/get-shit-done',
+    };
+    fs.writeFileSync(
+      path.join(manifestDir, 'plugin.json'),
+      JSON.stringify(manifest, null, 2) + '\n'
+    );
+    console.log(`  ${green}✓${reset} Wrote .claude-plugin/plugin.json`);
+
+    // Marketplace catalog. `source: "./plugins/gsd"` is a marketplace-root-
+    // relative path (the dir containing this .claude-plugin/). `..` paths
+    // are disallowed by Claude Code's marketplace schema.
+    const marketplaceManifestDir = path.join(marketplaceDir, '.claude-plugin');
+    fs.mkdirSync(marketplaceManifestDir, { recursive: true });
+    const marketplaceManifest = {
+      name: 'gsd-local',
+      owner: { name: 'gsd-build' },
+      plugins: [
+        {
+          name: 'gsd',
+          source: './plugins/gsd',
+          description: 'GSD (Get Shit Done) — phase-based AI dev workflow',
+        },
+      ],
+    };
+    fs.writeFileSync(
+      path.join(marketplaceManifestDir, 'marketplace.json'),
+      JSON.stringify(marketplaceManifest, null, 2) + '\n'
+    );
+    console.log(`  ${green}✓${reset} Wrote .claude-plugin/marketplace.json (catalog: gsd-local)`);
+
+    // VERSION marker at plugin root — /gsd-update probes this to detect
+    // a plugin-format install and re-invoke with --claude-plugin.
+    fs.writeFileSync(path.join(targetDir, 'VERSION'), pkg.version + '\n');
+    console.log(`  ${green}✓${reset} Wrote VERSION (${pkg.version})`);
+
+    // Build the hook manifest. Mirrors the entry shapes that writeSettings()
+    // would have written into ~/.claude/settings.json's hooks block — same
+    // matchers, same timeouts, same triggering events. The command paths
+    // resolve under ${CLAUDE_PLUGIN_ROOT}/bin/ where the install loop placed
+    // them above. Driven by GSD_HOOK_REGISTRY (single source of truth).
+    const pluginNodeRunner = resolveNodeRunner();
+    const pluginBashRunner = resolveBashRunner({ platform: process.platform });
+    const pluginBinRoot = '${CLAUDE_PLUGIN_ROOT}/bin';
+    const projectPluginHook = (runner, hookFile) => runner === null
+      ? null
+      : projectShellCommandText({
+        runnerToken: runner,
+        argTokens: [JSON.stringify(`${pluginBinRoot}/${hookFile}`)],
+        runtime: 'claude',
+        platform: process.platform,
+      });
+    const pluginHookCmd = (hookFile) => projectPluginHook(pluginNodeRunner, hookFile);
+    const pluginShCmd = (hookFile) => projectPluginHook(pluginBashRunner, hookFile);
+    const pluginBinDir = path.join(targetDir, 'bin');
+    // One readdir replaces 9× existsSync probes. Missing dir = empty set.
+    let pluginBinFiles;
+    try {
+      pluginBinFiles = new Set(fs.readdirSync(pluginBinDir));
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      pluginBinFiles = new Set();
+    }
+    const pluginHooks = { SessionStart: [], PreToolUse: [], PostToolUse: [] };
+    for (const entry of GSD_HOOK_REGISTRY) {
+      if (!pluginBinFiles.has(entry.file)) continue;
+      const cmd = entry.runner === 'bash'
+        ? pluginShCmd(entry.file)
+        : pluginHookCmd(entry.file);
+      if (!cmd) continue;
+      const hook = { type: 'command', command: cmd };
+      if (entry.timeout !== undefined) hook.timeout = entry.timeout;
+      const wrap = { hooks: [hook] };
+      if (entry.matcher) wrap.matcher = entry.matcher;
+      pluginHooks[entry.event].push(wrap);
+    }
+    // Drop empty buckets so the manifest matches Claude Code's expected shape.
+    for (const evt of Object.keys(pluginHooks)) {
+      if (pluginHooks[evt].length === 0) delete pluginHooks[evt];
+    }
+    const hooksDir = path.join(targetDir, 'hooks');
+    fs.mkdirSync(hooksDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(hooksDir, 'hooks.json'),
+      JSON.stringify({ hooks: pluginHooks }, null, 2) + '\n'
+    );
+    console.log(`  ${green}✓${reset} Wrote hooks/hooks.json`);
+
+    // Register the marketplace and install the plugin via the `claude` CLI.
+    // This is what makes the plugin auto-discoverable — without it, Claude
+    // Code never reads <project>/.claude/gsd/plugins/gsd/, regardless of how
+    // valid the manifest is. Letting the CLI write settings.json keeps the
+    // schema authoritative (Claude Code owns the shape of
+    // extraKnownMarketplaces / enabledPlugins) and preserves the
+    // "installer never touches ~/.claude/settings.json" invariant.
+    //
+    // Best-effort: surface stdout/stderr to the user but never fail the
+    // install on a CLI error. The plugin files are still useful via the
+    // manual `claude plugin marketplace add` + `claude plugin install` path
+    // that we print as the fallback.
+    const claudeScope = isGlobal ? 'user' : 'project';
+    const cliMarketplaceArg = path.resolve(marketplaceDir);
+    const cp = require('child_process');
+    const runClaude = (args, label) => {
+      try {
+        const out = cp.execSync(`claude ${args}`, {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        const trimmed = (out || '').trim();
+        if (trimmed) console.log(`    ${trimmed}`);
+        console.log(`  ${green}✓${reset} ${label}`);
+        return { ok: true };
+      } catch (err) {
+        const stderr = (err && err.stderr && err.stderr.toString()) || '';
+        const stdout = (err && err.stdout && err.stdout.toString()) || '';
+        const msg = (stderr || stdout || err.message || '').trim();
+        return { ok: false, msg };
+      }
+    };
+    console.log(`  Registering marketplace with Claude Code (scope: ${claudeScope})...`);
+    const addResult = runClaude(
+      `plugin marketplace add "${cliMarketplaceArg}" --scope ${claudeScope}`,
+      `claude plugin marketplace add (scope: ${claudeScope})`
+    );
+    if (!addResult.ok) {
+      // Treat absence of `claude` CLI and any other failure uniformly — the
+      // user gets the same manual-recovery commands either way.
+      console.log(`  ${yellow}⚠${reset} \`claude plugin marketplace add\` failed${addResult.msg ? `: ${addResult.msg}` : ''} — plugin emitted but not registered.`);
+      console.log(`     Run these two commands manually to activate it:`);
+      console.log(`       claude plugin marketplace add "${cliMarketplaceArg}" --scope ${claudeScope}`);
+      console.log(`       claude plugin install gsd@gsd-local --scope ${claudeScope}`);
+    } else {
+      const installResult = runClaude(
+        `plugin install gsd@gsd-local --scope ${claudeScope}`,
+        `claude plugin install gsd@gsd-local (scope: ${claudeScope})`
+      );
+      if (!installResult.ok) {
+        // Marketplace was added but plugin install failed — give the exact
+        // one-liner to re-run rather than leaving the user to reconstruct it.
+        console.log(`  ${yellow}⚠${reset} \`claude plugin install\` failed${installResult.msg ? `: ${installResult.msg}` : ''} — marketplace registered but plugin not installed.`);
+        console.log(`     Re-run this command to install the plugin:`);
+        console.log(`       claude plugin install gsd@gsd-local --scope ${claudeScope}`);
+      }
+    }
+
+    // No settings.json mutation — that is the whole point of plugin mode.
+    // The `claude plugin` CLI (above) owns the settings.json writes.
+    return {
+      settingsPath: null,
+      settings: null,
+      statuslineCommand: null,
+      updateBannerCommand: null,
+      runtime,
+      configDir: targetDir,
+      rollbackInstallerMigrations,
+      pluginMode: true,
+    };
+  }
+
   // Configure statusline and hooks in settings.json
   // Gemini and Antigravity use AfterTool instead of PostToolUse for post-tool hooks
   const postToolEvent = (runtime === 'gemini' || runtime === 'antigravity') ? 'AfterTool' : 'PostToolUse';
@@ -9513,7 +9892,7 @@ function install(isGlobal, runtime = 'claude', options = {}) {
 /**
  * Apply statusline config, then print completion message
  */
-function finishInstall(settingsPath, settings, statuslineCommand, shouldInstallStatusline, runtime = 'claude', isGlobal = true, configDir = null, bannerOpts = {}) {
+function finishInstall(settingsPath, settings, statuslineCommand, shouldInstallStatusline, runtime = 'claude', isGlobal = true, configDir = null, bannerOpts = {}, pluginMode = false) {
   const isOpencode = runtime === 'opencode';
   const isKilo = runtime === 'kilo';
   const isCodex = runtime === 'codex';
@@ -9523,7 +9902,7 @@ function finishInstall(settingsPath, settings, statuslineCommand, shouldInstallS
   const isTrae = runtime === 'trae';
   const isCline = runtime === 'cline';
 
-  if (shouldInstallStatusline && !isOpencode && !isKilo && !isCodex && !isCopilot && !isCursor && !isWindsurf && !isTrae) {
+  if (shouldInstallStatusline && !isOpencode && !isKilo && !isCodex && !isCopilot && !isCursor && !isWindsurf && !isTrae && !pluginMode) {
     if (!isGlobal && !forceStatusline) {
       // Local installs skip statusLine by default: repo settings.json takes precedence over
       // profile-level settings.json in Claude Code, so writing here would silently clobber
@@ -9581,7 +9960,7 @@ function finishInstall(settingsPath, settings, statuslineCommand, shouldInstallS
   // {type: 'command', command: null} items that the runtime hook schema
   // rejects at parse time. validateHookFields filters those out so the file
   // we write is always schema-valid.
-  if (!isCodex && !isCopilot && !isKilo && !isCursor && !isWindsurf && !isTrae && !isCline) {
+  if (!isCodex && !isCopilot && !isKilo && !isCursor && !isWindsurf && !isTrae && !isCline && !pluginMode) {
     writeSettings(settingsPath, validateHookFields(settings));
   }
 
@@ -11014,7 +11393,10 @@ function installAllRuntimes(runtimes, isGlobal, isInteractive) {
   }
 
   const statuslineRuntimes = ['claude', 'gemini'];
-  const primaryStatuslineResult = results.find(r => statuslineRuntimes.includes(r.runtime));
+  // Plugin mode never owns a settings.json statusline — its install() result
+  // returns settings: null. Exclude those from the statusline-prompt path so
+  // handleStatusline doesn't dereference null.
+  const primaryStatuslineResult = results.find(r => statuslineRuntimes.includes(r.runtime) && r.settings && !r.pluginMode);
 
   const finalize = (shouldInstallStatusline, shouldInstallBanner) => {
     try {
@@ -11036,7 +11418,8 @@ function installAllRuntimes(runtimes, isGlobal, isInteractive) {
             result.runtime,
             isGlobal,
             result.configDir,
-            { shouldInstallBanner: !!shouldInstallBanner, bannerCommand: result.updateBannerCommand }
+            { shouldInstallBanner: !!shouldInstallBanner, bannerCommand: result.updateBannerCommand },
+            !!result.pluginMode
           );
         }
       };
@@ -11245,7 +11628,7 @@ if (!process.env.GSD_TEST_MODE) {
     }
     const runtimes = selectedRuntimes.length > 0 ? selectedRuntimes : ['claude'];
     for (const runtime of runtimes) {
-      uninstall(hasGlobal, runtime);
+      uninstall(hasGlobal, runtime, hasClaudePlugin);
     }
   } else if (selectedRuntimes.length > 0) {
     if (!hasGlobal && !hasLocal) {

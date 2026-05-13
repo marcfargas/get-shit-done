@@ -816,7 +816,7 @@ function cmdValidateHealth(cwd, options, raw) {
   // Verify GSD agents are installed. Missing agents cause Task(subagent_type=...)
   // to silently fall back to general-purpose, losing specialized instructions.
   try {
-    const agentStatus = checkAgentsInstalled();
+    const agentStatus = checkAgentsInstalled(cwd);
     if (!agentStatus.agents_installed) {
       if (agentStatus.installed_agents.length === 0) {
         addIssue('warning', 'W010',
@@ -1193,7 +1193,7 @@ function cmdValidateHealth(cwd, options, raw) {
  */
 function cmdValidateAgents(cwd, raw) {
   const { MODEL_PROFILES } = require('./model-profiles.cjs');
-  const agentStatus = checkAgentsInstalled();
+  const agentStatus = checkAgentsInstalled(cwd);
   const expected = Object.keys(MODEL_PROFILES);
 
   output({

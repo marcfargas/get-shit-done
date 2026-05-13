@@ -38,7 +38,6 @@ import { resolveLegacyTemplatesDir } from './sdk-package-compatibility.js';
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const GSD_TEMPLATES_DIR = resolveLegacyTemplatesDir();
-const GSD_AGENTS_DIR = resolveAgentsDir();
 
 const RESEARCH_TYPES = ['STACK', 'FEATURES', 'ARCHITECTURE', 'PITFALLS'] as const;
 type ResearchType = (typeof RESEARCH_TYPES)[number];
@@ -648,8 +647,10 @@ export class InitRunner {
    * falls back to SDK bundled copies.
    */
   private async readAgentFile(filename: string): Promise<string> {
-    // Try installed agents first (complete, up-to-date versions)
-    const fullPath = join(GSD_AGENTS_DIR, filename);
+    // Try installed agents first (complete, up-to-date versions). Resolved
+    // lazily and project-aware so per-project `--claude-plugin` installs and
+    // late `GSD_AGENTS_DIR` env tweaks both win over module-load defaults.
+    const fullPath = join(resolveAgentsDir('claude', this.projectDir), filename);
     try {
       return await readFile(fullPath, 'utf-8');
     } catch {

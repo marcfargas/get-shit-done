@@ -22,9 +22,8 @@ import { homedir } from 'node:os';
 import { MODEL_PROFILES } from './config-query.js';
 import { GSDError, ErrorClassification } from '../errors.js';
 import { extractFrontmatter, parseMustHavesBlock } from './frontmatter.js';
-import { escapeRegex, normalizePhaseName, planningPaths, resolvePathUnderProject } from './helpers.js';
+import { escapeRegex, normalizePhaseName, planningPaths, resolveAgentsDir, resolvePathUnderProject } from './helpers.js';
 import type { QueryHandler } from './utils.js';
-import { resolveBundledAgentsDir } from '../sdk-package-compatibility.js';
 
 /** Max length for key_links regex patterns (ReDoS mitigation). */
 const MAX_KEY_LINK_PATTERN_LEN = 512;
@@ -943,13 +942,13 @@ export const validateHealth: QueryHandler = async (args, projectDir, workstream)
 // ─── validateAgents ────────────────────────────────────────────────────────
 
 /**
- * Default agents directory — mirrors `getAgentsDir` in `get-shit-done/bin/lib/core.cjs`:
- * `GSD_AGENTS_DIR`, else `../../../agents` relative to this module (`sdk/dist/query` → monorepo
- * root), matching `core.cjs` (`get-shit-done/bin/lib` → same repo `agents/`).
+ * Default agents directory for `validate.agents` — delegates to the shared
+ * `resolveAgentsDir` helper so the validator follows the same precedence as
+ * the rest of the SDK (`GSD_AGENTS_DIR` → per-project plugin → global plugin
+ * → runtime-default).
  */
-function getAgentsDirForValidateAgents(): string {
-  if (process.env.GSD_AGENTS_DIR) return process.env.GSD_AGENTS_DIR;
-  return resolveBundledAgentsDir();
+function getAgentsDirForValidateAgents(projectDir?: string): string {
+  return resolveAgentsDir('claude', projectDir);
 }
 
 /**
@@ -957,8 +956,8 @@ function getAgentsDirForValidateAgents(): string {
  *
  * Port of `cmdValidateAgents` from `verify.cjs` lines 997–1009 (uses `checkAgentsInstalled` from core).
  */
-export const validateAgents: QueryHandler = async (_args, _projectDir) => {
-  const agentsDir = getAgentsDirForValidateAgents();
+export const validateAgents: QueryHandler = async (_args, projectDir) => {
+  const agentsDir = getAgentsDirForValidateAgents(projectDir);
   const expected = Object.keys(MODEL_PROFILES);
   const installed: string[] = [];
   const missing: string[] = [];
